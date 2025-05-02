@@ -58,19 +58,23 @@ class UncertaintyFn(nn.Module):
 class UGATConv(MessagePassing):
     def __init__(self, in_channels, out_channels, heads=1, dropout=0.6):
         super().__init__(aggr='add', node_dim=0)
-        self.heads  = heads
-        self.out_c  = out_channels // heads
-        self.lin    = nn.Linear(in_channels, heads * self.out_c, bias=False)
-        self.drop_path = 0.1
-        if in_channels != heads * self.out_c:
-            self.res_lin = nn.Linear(in_channels, heads * self.out_c, bias=False)
-        else:
-            self.res_lin = nn.Identity()
-        self.att    = nn.Parameter(torch.Tensor(1, heads, 2*self.out_c))
-        self.unc_fn = UncertaintyFn(hidden_dim=out_channels//2)
-        self.dropout= dropout
-        self.layer_norm = nn.LayerNorm(heads * self.out_c)
+        self.heads   = heads
+        self.out_c   = out_channels // heads
+        self.lin     = nn.Linear(in_channels, heads*self.out_c, bias=False)
+        self.res_lin = (nn.Linear(in_channels, heads*self.out_c, bias=False)
+                        if in_channels!=heads*self.out_c else nn.Identity())
+        # AERO-GNN gate
+        self.att         = nn.Parameter(torch.Tensor(1, heads, 2*self.out_c))
+        self.use_aero    = True
+        self.gamma_gate  = nn.Parameter(torch.zeros(1, heads))  # γ init=0
+        self.register_buffer('prev_alpha', None)
+        # rest
+        self.unc_fn      = UncertaintyFn(hidden_dim=self.out_c)
+        self.dropout     = dropout
+        self.drop_path   = 0.1
+        self.layer_norm  = nn.LayerNorm(heads*self.out_c)
         self.reset_parameters()
+
     def reset_parameters(self):
         nn.init.xavier_uniform_(self.lin.weight)
         if isinstance(self.res_lin, nn.Linear):
@@ -78,40 +82,51 @@ class UGATConv(MessagePassing):
         nn.init.xavier_uniform_(self.att)
 
     def forward(self, x, edge_index, u):
-        h_in   = x
-        x_proj = self.lin(x).view(-1, self.heads, self.out_c)
+        # project + split heads
+        h_in   = x                                             # [N,F]
+        x_proj = self.lin(x).view(-1, self.heads, self.out_c) # [N,H,C]
+        # single propagate call
         out, u_new = self.propagate(edge_index, x=x_proj, u=u)
-        # concat heads
-        h_out = out.view(-1, self.heads * self.out_c)
-        h_res = self.res_lin(h_in) + h_out
-        if self.training and torch.rand(1, device=x.device) < self.drop_path:
-            h_res = self.layer_norm(self.res_lin(h_in))     # skip message
-        else:
-            h_res = self.layer_norm(h_res)
+        # combine heads + residual + norm
+        h_out = out.view(-1, self.heads*self.out_c)           # [N,HC]
+        res   = self.res_lin(h_in)
+        h_res = (self.layer_norm(res)
+                 if self.training and torch.rand(1,device=x.device)<self.drop_path
+                 else self.layer_norm(res+h_out))
         return h_res, u_new
 
-    # Message-passing
     def message(self, x_i, x_j, index, u_j):
-        a_input   = torch.cat([x_i, x_j], dim=-1)
-        alpha     = (a_input * self.att).sum(-1)
-        alpha     = F.leaky_relu(alpha, 0.2)
-        alpha     = softmax(alpha, index)
-        # uncertainty‑based weight
-        rho       = torch.exp(-u_j).unsqueeze(-1)
-        rho       = softmax(rho, index).repeat(1, self.heads)
-        m_coeff   = 0.5 * (alpha + rho)
-        m_coeff   = F.dropout(m_coeff, p=0.6, training=self.training)
-        return m_coeff.unsqueeze(-1) * x_j
+        # standard attention
+        a_in   = torch.cat([x_i, x_j], dim=-1)  # [E,H,2C]
+        alpha  = (a_in*self.att).sum(-1)        # [E,H]
+        alpha  = F.leaky_relu(alpha, 0.2)
+        alpha  = softmax(alpha, index)          # α^{(k)}
+        # store raw for next layer
+        self._alpha_buf = alpha.clone()
+        # AERO residual
+        if self.use_aero and self.prev_alpha is not None:
+            γ     = torch.sigmoid(self.gamma_gate)       # [1,H]
+            alpha = (1-γ)*alpha + γ*self.prev_alpha
+            alpha = softmax(alpha, index)                # renormalize
+        # uncertainty weighting
+        rho    = torch.exp(-u_j).unsqueeze(-1)           # [E,1]
+        rho    = softmax(rho, index).repeat(1,self.heads)
+        coeff  = F.dropout(0.5*(alpha+rho), p=self.dropout,
+                           training=self.training)
+        return coeff.unsqueeze(-1) * x_j               # [E,H,C]
 
-    # Update node embedding and uncertainty
     def update(self, aggr_out, x, edge_index):
-        out = aggr_out.view(-1, self.heads * self.out_c)
-        row, col = edge_index
-        diff = (x[row] - x[col]).pow(2).sum(-1)
-        var  = scatter_mean(diff, row, dim=0, dim_size=x.size(0))
-        var  = var.mean(dim=1)
-        new_u = self.unc_fn(var)
-        return out, new_u
+        # assemble new features
+        h     = aggr_out.view(-1, self.heads*self.out_c)
+        # compute new uncertainty
+        row,col = edge_index
+        diff  = (x[row]-x[col]).pow(2).sum(-1)
+        var   = scatter_mean(diff, row, dim=0, dim_size=x.size(0))
+        new_u = self.unc_fn(var.mean(-1) if var.dim()>1 else var)
+        # stash α for next hop
+        if self.use_aero:
+            self.prev_alpha = self._alpha_buf.detach()
+        return h, new_u
 
 # HU‑GNN model
 class HUGNN(nn.Module):
